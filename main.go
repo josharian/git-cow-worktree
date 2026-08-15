@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"strings"
@@ -113,40 +114,18 @@ func run(args []string) error {
 		src, srcOK, scoreVal = pickAutoSource(repoDir, targetAbs, targetSHA, opts.Verbose)
 	}
 	phase("pick source", t)
-	var result seedResult
+	var seededIndex string
 	if srcOK {
-		// Step 4: ls-tree both sides, compute reflink set.
-		t = time.Now()
-		targetTree, err := lsTree(targetAbs, targetSHA)
-		if err != nil {
-			return err
+		if opts.Verbose {
+			fmt.Fprintf(os.Stderr, "%s: source=%s (diff=%d commits)\n", commandName, src.Path, scoreVal)
 		}
-		targetTree, err = filterSparseCheckout(targetAbs, targetTree)
+		var err error
+		seededIndex, err = seed(src, targetAbs, targetSHA, phase, opts.Verbose)
 		if err != nil {
+			// Seeding is an optimization: anything that goes wrong here
+			// leaves the working tree to the checkout below.
 			if opts.Verbose {
-				fmt.Fprintf(os.Stderr, "%s: sparse-checkout filter failed (%v); falling through to checkout\n", commandName, err)
-			}
-			targetTree = map[string]TreeEntry{}
-		}
-		sourceTree, err := lsTree(src.Path, src.HEAD)
-		if err != nil {
-			if opts.Verbose {
-				fmt.Fprintf(os.Stderr, "%s: source ls-tree failed (%v); falling through to checkout\n", commandName, err)
-			}
-		} else {
-			phase("ls-tree", t)
-			t = time.Now()
-			paths := reflinkSet(sourceTree, targetTree)
-			phase("reflink-set diff", t)
-			t = time.Now()
-			result = reflinkAll(src.Path, targetAbs, paths)
-			phase("reflink", t)
-			if opts.Verbose {
-				fmt.Fprintf(os.Stderr, "%s: source=%s (diff=%d commits)\n", commandName, src.Path, scoreVal)
-				fmt.Fprintf(os.Stderr, "%s: reflinked %d/%d tracked files\n", commandName, result.Reflinked, result.Attempted)
-				if result.StopErr != nil {
-					fmt.Fprintf(os.Stderr, "%s: stopped reflinking: %v (falling through)\n", commandName, result.StopErr)
-				}
+				fmt.Fprintf(os.Stderr, "%s: seeding skipped: %v\n", commandName, err)
 			}
 		}
 	} else if opts.Verbose {
@@ -156,7 +135,23 @@ func run(args []string) error {
 	// Step 6: finalize.
 	t = time.Now()
 	if err := finalizeCheckout(targetAbs, targetSHA); err != nil {
-		return err
+		if seededIndex == "" {
+			return err
+		}
+		// The index we wrote is the only thing here Git didn't produce
+		// itself. Discard it and let Git check the worktree out from
+		// scratch rather than leaving the user a half-populated one.
+		// A checkout that died mid-flight leaves its lock behind; in a
+		// worktree this new, nobody else can own it.
+		fmt.Fprintf(os.Stderr, "%s: checkout failed against seeded index (%v); retrying from scratch\n", commandName, err)
+		for _, path := range []string{seededIndex, seededIndex + ".lock"} {
+			if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+				return err
+			}
+		}
+		if err := finalizeCheckout(targetAbs, targetSHA); err != nil {
+			return err
+		}
 	}
 	phase("checkout", t)
 
@@ -164,6 +159,85 @@ func run(args []string) error {
 		fmt.Fprintf(os.Stderr, "%s: %-20s %v\n", commandName, "total", time.Since(overallStart).Round(time.Millisecond))
 	}
 	return nil
+}
+
+// seed reflinks as much of the new worktree as it can from src, and writes
+// an index vouching for what it reflinked so the checkout that follows
+// leaves those files — and their shared storage — alone. It returns the
+// path of the index it wrote, if any.
+//
+// Every step is best-effort. Returning an error, or returning nothing,
+// means the caller's checkout writes the worktree the ordinary way.
+func seed(src Worktree, targetAbs, targetSHA string, phase func(string, time.Time), verbose bool) (string, error) {
+	t := time.Now()
+	targetTree, err := lsTree(targetAbs, targetSHA)
+	if err != nil {
+		return "", err
+	}
+	sparse, err := sparseCheckoutEnabled(targetAbs)
+	if err != nil {
+		return "", err
+	}
+	if sparse {
+		// Only some of a directory's files get materialized, so cloning
+		// whole directories would import files the user excluded.
+		targetTree, err = filterSparseCheckout(targetAbs, targetTree)
+		if err != nil {
+			return "", err
+		}
+	}
+	sourceTree, err := lsTree(src.Path, src.HEAD)
+	if err != nil {
+		return "", err
+	}
+	excluded, err := sourceExclusions(src.Path, src.HEAD)
+	if err != nil {
+		return "", err
+	}
+	phase("inspect trees", t)
+
+	// GIT_COW_WORKTREE_NO_DIR_CLONE exercises the file-by-file path, which
+	// is what Linux always takes, on a filesystem that can clone directories.
+	cloneDirs := canCloneDirs && !sparse && os.Getenv("GIT_COW_WORKTREE_NO_DIR_CLONE") == ""
+
+	t = time.Now()
+	plan := planClones(sourceTree, targetTree, excluded, cloneDirs)
+	phase("plan", t)
+
+	t = time.Now()
+	result := plan.clone(src.Path, targetAbs)
+	phase("clone", t)
+	if verbose {
+		fmt.Fprintf(os.Stderr, "%s: planned %s; cloned %d dirs, %d files\n",
+			commandName, plan, result.Dirs, result.Files)
+	}
+	if result.StopErr != nil {
+		return "", fmt.Errorf("stopped cloning: %w", result.StopErr)
+	}
+	if result.Dirs == 0 && result.Files == 0 {
+		return "", nil
+	}
+
+	t = time.Now()
+	entries := validateClones(targetAbs, targetTree, plan)
+	phase("validate", t)
+	if verbose {
+		fmt.Fprintf(os.Stderr, "%s: verified %d files\n", commandName, len(entries))
+	}
+	if len(entries) == 0 {
+		return "", nil
+	}
+
+	t = time.Now()
+	path, err := indexPath(targetAbs)
+	if err != nil {
+		return "", err
+	}
+	if err := writeIndex(path, entries); err != nil {
+		return "", err
+	}
+	phase("write index", t)
+	return path, nil
 }
 
 func resolveFromPath(fromPath string) (Worktree, error) {

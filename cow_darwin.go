@@ -19,7 +19,17 @@ var cowUnsupportedErrnos = []error{
 	syscall.EOPNOTSUPP,
 }
 
+// APFS clones whole directory hierarchies in a single clonefile call,
+// which is dramatically cheaper than one call per file.
+const canCloneDirs = true
+
 // cowClone reflinks src to dst. dst must not exist.
 func cowClone(src, dst string) error {
+	return unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW)
+}
+
+// cowCloneDir recursively reflinks the directory src to dst, which must
+// not exist.
+func cowCloneDir(src, dst string) error {
 	return unix.Clonefile(src, dst, unix.CLONE_NOFOLLOW)
 }

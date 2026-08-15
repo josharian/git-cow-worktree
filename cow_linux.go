@@ -19,6 +19,15 @@ var cowUnsupportedErrnos = []error{
 	syscall.EINVAL, // returned on some filesystems when reflink isn't applicable
 }
 
+// FICLONE works on regular files only, so on Linux we always clone
+// file by file.
+const canCloneDirs = false
+
+// cowCloneDir is never called on Linux; see canCloneDirs.
+func cowCloneDir(src, dst string) error {
+	return errCoWUnsupported
+}
+
 // cowClone reflinks src to dst on a CoW-capable filesystem (btrfs, xfs
 // with reflink, bcachefs, ...). dst must not exist. We refuse to follow
 // symlinks at src to match darwin's CLONE_NOFOLLOW; reflinkSet already

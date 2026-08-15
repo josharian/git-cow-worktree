@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // e2e tests exec real `git` against repos built in t.TempDir().
@@ -124,6 +125,55 @@ func TestE2E_DropInInvariant(t *testing.T) {
 			fromName: "src",
 		},
 		{
+			name: "staged-change-in-source",
+			setup: func(t *testing.T, r *repo) {
+				r.commit("dir/a.txt", "committed")
+				r.commit("dir/b.txt", "untouched")
+				r.branch("target", "HEAD")
+				r.worktree("src", "target")
+				// Staged, so the working tree matches the source's index
+				// but not the commit we're cloning from.
+				r.writeAt("src", "dir/a.txt", "staged-content")
+				r.runAt("src", "git", "add", "dir/a.txt")
+			},
+			target:   "target",
+			fromName: "src",
+		},
+		{
+			name: "untracked-and-ignored-in-source",
+			setup: func(t *testing.T, r *repo) {
+				r.commit(".gitignore", "*.out\n")
+				r.commit("dir/a.txt", "alpha")
+				r.commit("dir/b.txt", "beta")
+				r.branch("target", "HEAD")
+				r.worktree("src", "target")
+				// Neither of these belongs to the new worktree, even
+				// though dir/ is otherwise identical on both sides.
+				r.writeAt("src", "dir/scratch.txt", "untracked")
+				r.writeAt("src", "dir/build.out", "ignored")
+			},
+			target:   "target",
+			fromName: "src",
+		},
+		{
+			name: "nested-identical-directories",
+			setup: func(t *testing.T, r *repo) {
+				for _, d := range []string{"a", "a/b", "a/b/c", "d"} {
+					for i := range 5 {
+						r.commit(filepath.Join(d, "f"+itoa(i)+".txt"), d+"-"+itoa(i))
+					}
+				}
+				r.branch("base", "HEAD")
+				r.worktree("src", "base")
+				// One file changes; only the directories on its path
+				// should lose their whole-directory clone.
+				r.commit("a/b/c/f0.txt", "changed")
+				r.branch("target", "HEAD")
+			},
+			target:   "target",
+			fromName: "src",
+		},
+		{
 			name: "many-files-with-overlap",
 			setup: func(t *testing.T, r *repo) {
 				for i := range 30 {
@@ -183,8 +233,154 @@ func TestE2E_DropInInvariant(t *testing.T) {
 			// Diff the tracked-file trees. We ignore .git (it's a file
 			// inside a worktree, pointing to different parent dirs).
 			diffWorktrees(t, plainOut, cowOut)
+			assertIndexUpToDate(t, cowOut, plainOut)
+			assertShared(t, cowSource, cowOut)
 		})
 	}
+}
+
+// TestE2E_FileByFileClone covers the path taken where directories can't be
+// cloned in one call, which is every Linux filesystem.
+func TestE2E_FileByFileClone(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	gitCowWorktree := buildGitCowWorktree(t)
+
+	mkRepo := func(label string) *repo {
+		r := newRepo(t, label)
+		for _, d := range []string{".", "a", "a/b"} {
+			for i := range 4 {
+				r.commit(filepath.Join(d, "f"+itoa(i)+".txt"), d+"-"+itoa(i))
+			}
+		}
+		r.branch("target", "HEAD")
+		r.worktree("src", "target")
+		return r
+	}
+	cowRepo, plainRepo := mkRepo("cow"), mkRepo("plain")
+
+	cowOut := filepath.Join(cowRepo.parent, "out-cow")
+	cowSource := filepath.Join(cowRepo.parent, "src")
+	cmd := exec.Command(gitCowWorktree, "add", "-v", "--from", cowSource, "--detach", cowOut, "target")
+	cmd.Dir = cowRepo.dir
+	cmd.Env = append(os.Environ(), "GIT_COW_WORKTREE_NO_DIR_CLONE=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git-cow-worktree add: %v\n%s", err, stderr.String())
+	}
+	t.Logf("git-cow-worktree output:\n%s", stderr.String())
+	if !strings.Contains(stderr.String(), "planned 0 dirs, 12 files") {
+		t.Errorf("expected 12 individual file clones, got:\n%s", stderr.String())
+	}
+
+	plainOut := filepath.Join(plainRepo.parent, "out-plain")
+	cmd2 := exec.Command("git", "worktree", "add", "--detach", plainOut, "target")
+	cmd2.Dir = plainRepo.dir
+	if out, err := cmd2.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v\n%s", err, string(out))
+	}
+
+	diffWorktrees(t, plainOut, cowOut)
+	assertIndexUpToDate(t, cowOut, plainOut)
+	assertShared(t, cowSource, cowOut)
+}
+
+// TestE2E_UnusableIndexRecovers checks that a worktree still comes out
+// correct if Git rejects the index we hand it: the index is ours alone, so
+// a bad one must cost time, not correctness.
+func TestE2E_UnusableIndexRecovers(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	gitCowWorktree := buildGitCowWorktree(t)
+
+	mkRepo := func(label string) *repo {
+		r := newRepo(t, label)
+		r.commit("a.txt", "alpha")
+		r.commit("dir/b.txt", "beta")
+		r.branch("target", "HEAD")
+		r.worktree("src", "target")
+		return r
+	}
+	cowRepo, plainRepo := mkRepo("cow"), mkRepo("plain")
+
+	cowOut := filepath.Join(cowRepo.parent, "out-cow")
+	cmd := exec.Command(gitCowWorktree, "add", "-v", "--from", filepath.Join(cowRepo.parent, "src"), "--detach", cowOut, "target")
+	cmd.Dir = cowRepo.dir
+	cmd.Env = append(os.Environ(), "GIT_COW_WORKTREE_CORRUPT_INDEX=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git-cow-worktree add: %v\n%s", err, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "retrying from scratch") {
+		t.Errorf("expected the recovery path to report itself, got:\n%s", stderr.String())
+	}
+
+	plainOut := filepath.Join(plainRepo.parent, "out-plain")
+	cmd2 := exec.Command("git", "worktree", "add", "--detach", plainOut, "target")
+	cmd2.Dir = plainRepo.dir
+	if out, err := cmd2.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v\n%s", err, string(out))
+	}
+
+	diffWorktrees(t, plainOut, cowOut)
+	assertIndexUpToDate(t, cowOut, plainOut)
+}
+
+// TestE2E_StatCleanButModifiedSource covers a source file that Git's stat
+// cache believes is clean but whose content has changed underneath it. The
+// content check has to catch it; nothing else will.
+func TestE2E_StatCleanButModifiedSource(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	gitCowWorktree := buildGitCowWorktree(t)
+
+	r := newRepo(t, "main")
+	r.commit("a.txt", "0123456789")
+	r.commit("b.txt", "untouched")
+	r.branch("target", "HEAD")
+	r.worktree("src", "target")
+
+	src := filepath.Join(r.parent, "src")
+	// With ctime out of the picture, a same-size overwrite that restores
+	// mtime is invisible to `git diff-files`. The mtime has to predate the
+	// index, or Git treats the entry as racily clean and rehashes it.
+	runIn(t, src, "git", "config", "core.trustctime", "false")
+	aPath := filepath.Join(src, "a.txt")
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(aPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	runIn(t, src, "git", "update-index", "--refresh")
+	if err := os.WriteFile(aPath, []byte("9876543210"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(aPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if out := gitOutput(t, src, "diff-files", "--name-only"); out != "" {
+		t.Skipf("source worktree reports the change (%q); nothing to test", out)
+	}
+
+	out := filepath.Join(r.parent, "out")
+	cmd := exec.Command(gitCowWorktree, "add", "-v", "--from", src, "--detach", out, "target")
+	cmd.Dir = r.dir
+	if got, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git-cow-worktree add: %v\n%s", err, string(got))
+	}
+
+	got, err := os.ReadFile(filepath.Join(out, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "0123456789" {
+		t.Errorf("a.txt = %q, want the committed content", string(got))
+	}
+	assertIndexUpToDate(t, out, "")
 }
 
 // TestE2E_NoCowFilesystem forces the binary down the "CoW unsupported"
@@ -221,9 +417,9 @@ func TestE2E_NoCowFilesystem(t *testing.T) {
 		t.Fatalf("git-cow-worktree add: %v\n%s", err, cowStderr.String())
 	}
 	t.Logf("git-cow-worktree output:\n%s", cowStderr.String())
-	if !strings.Contains(cowStderr.String(), "reflinked 0/") &&
-		!strings.Contains(cowStderr.String(), "stopped reflinking") {
-		t.Errorf("expected verbose output to show 0 reflinks or stop, got:\n%s", cowStderr.String())
+	if !strings.Contains(cowStderr.String(), "cloned 0 dirs, 0 files") &&
+		!strings.Contains(cowStderr.String(), "stopped cloning") {
+		t.Errorf("expected verbose output to show nothing cloned, got:\n%s", cowStderr.String())
 	}
 
 	cmd2 := exec.Command("git", "worktree", "add", "--detach", plainOut, "target")
@@ -272,8 +468,8 @@ func TestE2E_AutoPickSource(t *testing.T) {
 	if !strings.Contains(sb.String(), "source=") {
 		t.Errorf("expected auto-picked source in verbose output, got:\n%s", sb.String())
 	}
-	if !strings.Contains(sb.String(), "reflinked ") {
-		t.Errorf("expected reflink count in verbose output, got:\n%s", sb.String())
+	if !strings.Contains(sb.String(), "cloned ") {
+		t.Errorf("expected clone count in verbose output, got:\n%s", sb.String())
 	}
 
 	cmd2 := exec.Command("git", "worktree", "add", "--detach", plainOut, "target")
@@ -515,6 +711,9 @@ func TestE2E_PostCheckoutHookArgsSHA256(t *testing.T) {
 	if len(targetSHA) != 64 {
 		t.Fatalf("target object ID length = %d, want 64", len(targetSHA))
 	}
+	// The index we write embeds object IDs, so it is hash-size specific.
+	assertIndexUpToDate(t, out, "")
+	assertShared(t, filepath.Join(r.parent, "src"), out)
 	if fields[1] != targetSHA {
 		t.Fatalf("new HEAD = %s, want %s", fields[1], targetSHA)
 	}
@@ -736,6 +935,12 @@ func (r *repo) sparseCheckout(paths ...string) {
 	r.run(args...)
 }
 
+// runAt runs a command inside an existing worktree under r.parent.
+func (r *repo) runAt(worktreeName string, args ...string) {
+	r.t.Helper()
+	runIn(r.t, filepath.Join(r.parent, worktreeName), args...)
+}
+
 // writeAt writes to a path inside an existing worktree under r.parent
 // without committing — i.e., produces a dirty working tree.
 func (r *repo) writeAt(worktreeName, path, content string) {
@@ -746,6 +951,105 @@ func (r *repo) writeAt(worktreeName, path, content string) {
 	}
 	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 		r.t.Fatal(err)
+	}
+}
+
+func runIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s: %v\n%s", strings.Join(args, " "), err, string(out))
+	}
+}
+
+// cowSupported reports whether the filesystem under dir can reflink, so
+// that sharing assertions can be skipped where they'd be meaningless.
+func cowSupported(t *testing.T, dir string) bool {
+	t.Helper()
+	src := filepath.Join(dir, "cow-probe-src")
+	if err := os.WriteFile(src, []byte("probe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(src)
+	dst := filepath.Join(dir, "cow-probe-dst")
+	defer os.Remove(dst)
+	err := cowClone(src, dst)
+	if err != nil && isCoWUnsupported(err) {
+		return false
+	}
+	if err != nil {
+		t.Fatalf("cowClone probe: %v", err)
+	}
+	return true
+}
+
+// assertShared asserts that files the new worktree shares with its source
+// were reflinked rather than rewritten. Rewriting is the failure mode that
+// costs the disk savings, and it is visible: Git writes a new file with a
+// fresh mtime, while a clone keeps the source's to the nanosecond.
+//
+// Every regular file whose content matches the source is expected to have
+// been shared; a file that legitimately had to be written (changed, dirty,
+// or absent in the source) has different content and is skipped.
+func assertShared(t *testing.T, src, dst string) {
+	t.Helper()
+	if !cowSupported(t, t.TempDir()) {
+		t.Log("filesystem does not support reflinks; skipping sharing checks")
+		return
+	}
+	srcFiles, dstFiles := snapshot(t, src), snapshot(t, dst)
+	var shared int
+	for path, sig := range dstFiles {
+		if sig.mode != "f" && sig.mode != "fx" {
+			continue // symlinks are Git's to write
+		}
+		if srcFiles[path] != sig {
+			continue
+		}
+		srcInfo, err := os.Lstat(filepath.Join(src, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dstInfo, err := os.Lstat(filepath.Join(dst, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(srcInfo, dstInfo) {
+			t.Errorf("%s is the same file in both worktrees, want a distinct clone", path)
+			continue
+		}
+		if !dstInfo.ModTime().Equal(srcInfo.ModTime()) {
+			t.Errorf("%s was rewritten by checkout (mtime %v, source %v), so its storage is not shared",
+				path, dstInfo.ModTime(), srcInfo.ModTime())
+			continue
+		}
+		shared++
+	}
+	t.Logf("verified %d/%d files share storage with %s", shared, len(dstFiles), src)
+}
+
+// assertIndexUpToDate asserts that the worktree Git ended up with is one it
+// fully agrees with: nothing modified, and every cache entry's stat data
+// current, so no later command has to re-hash the files we vouched for. If
+// reference is non-empty, the staged index content must match that
+// worktree's, entry for entry.
+func assertIndexUpToDate(t *testing.T, worktree, reference string) {
+	t.Helper()
+	if out := gitOutput(t, worktree, "status", "--porcelain"); out != "" {
+		t.Errorf("worktree is not clean:\n%s", out)
+	}
+	// --refresh prints "<path>: needs update" for entries whose stat data
+	// doesn't match, and exits non-zero.
+	cmd := exec.Command("git", "update-index", "--refresh")
+	cmd.Dir = worktree
+	if out, err := cmd.CombinedOutput(); err != nil || len(out) > 0 {
+		t.Errorf("index stat data is stale (%v):\n%s", err, string(out))
+	}
+	if reference != "" {
+		if got, want := gitOutput(t, worktree, "ls-files", "--stage"), gitOutput(t, reference, "ls-files", "--stage"); got != want {
+			t.Errorf("index contents differ from a plain checkout's:\ngot:\n%s\nwant:\n%s", got, want)
+		}
 	}
 }
 

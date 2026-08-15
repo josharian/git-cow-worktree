@@ -35,7 +35,7 @@ Most flags are inherited from `git worktree add`.
 Added by `git-cow-worktree`:
 
 - `--from <path>`: use a specific source worktree instead of auto-selecting one.
-- `-v`, `--verbose`: print the chosen source, reflink count, and timings.
+- `-v`, `--verbose`: print the chosen source, clone counts, and timings.
 
 Special case:
 
@@ -51,10 +51,12 @@ Reflinking is supported on APFS on macOS and on Linux filesystems with `FICLONE`
 
 ## How it works
 
-It first runs `git worktree add --no-checkout`, so Git creates the new worktree metadata and index but leaves the working tree empty.
+It first runs `git worktree add --no-checkout`, so Git creates the new worktree metadata but leaves the working tree empty.
 
 Then it picks a source worktree. Candidates are the current worktree, the main worktree, and a few recently modified other worktrees. It ignores the target worktree and unmaterialized worktrees. Candidates are scored by `git rev-list --left-right --count <source>...<target>`; fewer commits ahead/behind is better.
 
-It runs `git ls-tree -r` on the source and target commits, then reflinks regular tracked files whose blob SHA and mode match exactly. Symlinks, submodules, missing files, changed files, and mode mismatches are left alone.
+It runs `git ls-tree -r -t` on the source and target commits and plans the cheapest way to materialize each path. A directory whose tree SHA is the same on both sides has identical tracked contents, so where the filesystem supports it (APFS does; Linux reflinks are file-only) the whole directory is cloned in a single syscall. Otherwise it descends and reflinks matching files one by one. Paths that are dirty, untracked, ignored, or submodules in the source are skipped, along with symlinks and mode mismatches.
 
-Finally it runs Git checkout in the new worktree. That fills in files that were not reflinked, overwrites anything stale or dirty, updates stat info, and makes partial reflink failure safe. If reflinks are unsupported or cross-device, it just becomes a normal checkout.
+Every cloned file is then hashed and compared against the blob it is supposed to be, and the ones that check out are written to the new worktree's index with their stat data. This is the step that preserves the sharing: Git decides whether to rewrite a working-tree file by comparing it against its index entry, and a worktree with no index — which is what `--no-checkout` leaves behind — makes checkout rewrite every file, undoing every clone. Hashing in parallel is also substantially cheaper than letting Git refresh the index itself, which is single-threaded and uses a collision-detecting SHA-1.
+
+Finally it runs Git checkout in the new worktree. That fills in files that were not cloned, overwrites anything stale, and produces the same index a plain checkout would. Every step before it is best-effort: if reflinks are unsupported, if the source can't be inspected, or if the index can't be written, the checkout still runs and just becomes a normal one.
