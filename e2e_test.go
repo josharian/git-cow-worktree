@@ -480,6 +480,66 @@ func TestE2E_AutoPickSource(t *testing.T) {
 	diffWorktrees(t, plainOut, cowOut)
 }
 
+// TestE2E_GuessRemoteRetargets covers a target commit that isn't the one we
+// predicted. Seeding is analyzed against a guess at the target — resolved
+// from the command line, so that the analysis can run while `git worktree
+// add` does — and --guess-remote is a case where Git lands somewhere else
+// entirely: on the remote branch named after the path, not on HEAD. The
+// analysis has to be redone against the real HEAD, and the worktree must
+// still come out identical to plain Git's.
+func TestE2E_GuessRemoteRetargets(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	gitCowWorktree := buildGitCowWorktree(t)
+
+	// A clone whose HEAD (main) differs from the branch --guess-remote will
+	// find, so guessing HEAD would seed from the wrong tree.
+	mkClone := func(label string) string {
+		r := newRepo(t, label)
+		r.commit("a.txt", "alpha")
+		r.commit("dir/b.txt", "beta")
+		r.run("git", "checkout", "-q", "-b", "feature")
+		r.commit("a.txt", "alpha-on-feature")
+		r.commit("dir/c.txt", "gamma")
+		r.run("git", "checkout", "-q", "main")
+
+		clone := filepath.Join(r.parent, "clone-"+label)
+		cmd := exec.Command("git", "clone", "-q", r.dir, clone)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git clone: %v\n%s", err, string(out))
+		}
+		return clone
+	}
+
+	cowClone := mkClone("guess-cow")
+	plainClone := mkClone("guess-plain")
+	// --guess-remote keys off the path's base name, so both must be "feature".
+	cowOut := filepath.Join(cowClone, "..", "wt-cow", "feature")
+	plainOut := filepath.Join(plainClone, "..", "wt-plain", "feature")
+
+	cmd := exec.Command(gitCowWorktree, "add", "-v", "--guess-remote", cowOut)
+	cmd.Dir = cowClone
+	var sb bytes.Buffer
+	cmd.Stderr = &sb
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git-cow-worktree add: %v\n%s", err, sb.String())
+	}
+	t.Logf("git-cow-worktree output:\n%s", sb.String())
+
+	cmd2 := exec.Command("git", "worktree", "add", "--guess-remote", plainOut)
+	cmd2.Dir = plainClone
+	if out, err := cmd2.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v\n%s", err, string(out))
+	}
+
+	if got := gitOutput(t, cowOut, "rev-parse", "--abbrev-ref", "HEAD"); got != "feature" {
+		t.Errorf("HEAD = %q, want the guessed-at remote branch %q", got, "feature")
+	}
+	diffWorktrees(t, plainOut, cowOut)
+	assertIndexUpToDate(t, cowOut, "")
+}
+
 func TestE2E_SparseCheckout(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not on PATH")

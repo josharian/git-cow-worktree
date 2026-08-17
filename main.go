@@ -1,12 +1,14 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -60,12 +62,18 @@ func run(args []string) error {
 		return err
 	}
 
-	var explicitSource Worktree
+	var explicitSource *Worktree
 	if opts.FromSpecified {
-		explicitSource, err = resolveFromPath(opts.FromPath)
+		wt, err := resolveFromPath(opts.FromPath)
 		if err != nil {
 			return err
 		}
+		explicitSource = &wt
+	}
+
+	targetAbs, err := osAbs(opts.TargetPath)
+	if err != nil {
+		return err
 	}
 
 	overallStart := time.Now()
@@ -75,7 +83,17 @@ func run(args []string) error {
 		}
 	}
 
-	// Step 2: git worktree add --no-checkout [user flags].
+	// Step 2: git worktree add --no-checkout [user flags], and, alongside
+	// it, the analysis that feeds seeding. The two are independent: the
+	// analysis reads the object store and the source worktree, and touches
+	// nothing under the new worktree.
+	//
+	// What it does need is the target commit, which Git doesn't settle
+	// until the worktree exists. An explicit <commit-ish> — or HEAD, when
+	// one is omitted — resolves to that commit in all but the DWIM cases
+	// (--guess-remote and friends), so we resolve it ourselves and check
+	// the guess against the real HEAD below, redoing the analysis on the
+	// rare miss.
 	addArgs := append([]string{"worktree", "add", "--no-checkout"}, opts.Forward...)
 	if opts.UseSeparator {
 		addArgs = append(addArgs, "--")
@@ -85,42 +103,40 @@ func run(args []string) error {
 		addArgs = append(addArgs, opts.CommitIsh)
 	}
 	t := time.Now()
-	if err := runGitStreaming(repoDir, addArgs...); err != nil {
-		return fmt.Errorf("git worktree add: %w", err)
+	var addErr error
+	var wg sync.WaitGroup
+	wg.Go(func() { addErr = runGitStreaming(repoDir, addArgs...) })
+
+	guessRev := cmp.Or(opts.CommitIsh, "HEAD")
+	var a *analysis
+	if sha, err := resolveRev(repoDir, guessRev); err == nil {
+		a = analyze(repoDir, targetAbs, sha, explicitSource, opts.Verbose)
+	}
+
+	wg.Wait()
+	if addErr != nil {
+		return fmt.Errorf("git worktree add: %w", addErr)
 	}
 	phase("worktree add", t)
-
-	targetAbs, err := osAbs(opts.TargetPath)
-	if err != nil {
-		return err
-	}
 
 	// Resolve target SHA from inside the new worktree (HEAD is now set).
 	targetSHA, err := resolveRev(targetAbs, "HEAD")
 	if err != nil {
 		return err
 	}
-
-	// Step 3: pick source.
-	t = time.Now()
-	var src Worktree
-	var srcOK bool
-	var scoreVal int
-	if opts.FromSpecified {
-		src = explicitSource
-		srcOK = true
-		scoreVal, _ = commitDistance(repoDir, src.HEAD, targetSHA)
-	} else {
-		src, srcOK, scoreVal = pickAutoSource(repoDir, targetAbs, targetSHA, opts.Verbose)
+	if a == nil || a.SHA != targetSHA {
+		t = time.Now()
+		a = analyze(repoDir, targetAbs, targetSHA, explicitSource, opts.Verbose)
+		phase("analyze", t)
 	}
-	phase("pick source", t)
+
 	var seededIndex string
-	if srcOK {
+	if a.SrcOK {
 		if opts.Verbose {
-			fmt.Fprintf(os.Stderr, "%s: source=%s (diff=%d commits)\n", commandName, src.Path, scoreVal)
+			fmt.Fprintf(os.Stderr, "%s: source=%s (diff=%d commits)\n", commandName, a.Src.Path, a.Score)
 		}
 		var err error
-		seededIndex, err = seed(src, targetAbs, targetSHA, phase, opts.Verbose)
+		seededIndex, err = seed(a, targetAbs, phase, opts.Verbose)
 		if err != nil {
 			// Seeding is an optimization: anything that goes wrong here
 			// leaves the working tree to the checkout below.
@@ -161,6 +177,50 @@ func run(args []string) error {
 	return nil
 }
 
+// analysis is everything the clone plan needs that depends only on the
+// repository and the target commit, and not on the new worktree existing.
+// Keeping that boundary sharp is what lets the work overlap `git worktree
+// add`.
+type analysis struct {
+	SHA        string // target commit the rest of this describes
+	Src        Worktree
+	SrcOK      bool
+	Score      int // commits between Src and the target
+	TargetTree *treeIndex
+	SrcTree    *treeIndex
+	Excluded   map[string]bool
+	Err        error
+}
+
+// analyze picks a source worktree to clone targetSHA from and reads what
+// planning needs from both sides. If explicit is non-nil it is used as the
+// source instead of the best available one.
+//
+// The three reads are independent Git invocations, so they run together;
+// ls-tree of the target reads the object store, which the repository the
+// command was run from can serve just as well as the new worktree.
+func analyze(repoDir, targetAbs, targetSHA string, explicit *Worktree, verbose bool) *analysis {
+	a := &analysis{SHA: targetSHA}
+	if explicit != nil {
+		a.Src, a.SrcOK = *explicit, true
+		a.Score, _ = commitDistance(repoDir, a.Src.HEAD, targetSHA)
+	} else {
+		a.Src, a.SrcOK, a.Score = pickAutoSource(repoDir, targetAbs, targetSHA, verbose)
+	}
+	if !a.SrcOK {
+		return a
+	}
+
+	var targetErr, srcErr, exclErr error
+	var wg sync.WaitGroup
+	wg.Go(func() { a.TargetTree, targetErr = lsTree(repoDir, targetSHA) })
+	wg.Go(func() { a.SrcTree, srcErr = lsTree(a.Src.Path, a.Src.HEAD) })
+	wg.Go(func() { a.Excluded, exclErr = sourceExclusions(a.Src.Path, a.Src.HEAD) })
+	wg.Wait()
+	a.Err = cmp.Or(targetErr, srcErr, exclErr)
+	return a
+}
+
 // seed reflinks as much of the new worktree as it can from src, and writes
 // an index vouching for what it reflinked so the checkout that follows
 // leaves those files — and their shared storage — alone. It returns the
@@ -168,12 +228,15 @@ func run(args []string) error {
 //
 // Every step is best-effort. Returning an error, or returning nothing,
 // means the caller's checkout writes the worktree the ordinary way.
-func seed(src Worktree, targetAbs, targetSHA string, phase func(string, time.Time), verbose bool) (string, error) {
-	t := time.Now()
-	targetTree, err := lsTree(targetAbs, targetSHA)
-	if err != nil {
-		return "", err
+func seed(a *analysis, targetAbs string, phase func(string, time.Time), verbose bool) (string, error) {
+	if a.Err != nil {
+		return "", a.Err
 	}
+
+	// Sparse checkout is worktree-local configuration, so unlike the rest of
+	// the analysis this has to wait for the new worktree to exist.
+	t := time.Now()
+	targetTree := a.TargetTree
 	sparse, err := sparseCheckoutEnabled(targetAbs)
 	if err != nil {
 		return "", err
@@ -186,26 +249,18 @@ func seed(src Worktree, targetAbs, targetSHA string, phase func(string, time.Tim
 			return "", err
 		}
 	}
-	sourceTree, err := lsTree(src.Path, src.HEAD)
-	if err != nil {
-		return "", err
-	}
-	excluded, err := sourceExclusions(src.Path, src.HEAD)
-	if err != nil {
-		return "", err
-	}
-	phase("inspect trees", t)
+	phase("sparse check", t)
 
 	// GIT_COW_WORKTREE_NO_DIR_CLONE exercises the file-by-file path, which
 	// is what Linux always takes, on a filesystem that can clone directories.
 	cloneDirs := canCloneDirs && !sparse && os.Getenv("GIT_COW_WORKTREE_NO_DIR_CLONE") == ""
 
 	t = time.Now()
-	plan := planClones(sourceTree, targetTree, excluded, cloneDirs)
+	plan := planClones(a.SrcTree, targetTree, a.Excluded, cloneDirs)
 	phase("plan", t)
 
 	t = time.Now()
-	result := plan.clone(src.Path, targetAbs)
+	result := plan.clone(a.Src.Path, targetAbs)
 	phase("clone", t)
 	if verbose {
 		fmt.Fprintf(os.Stderr, "%s: planned %s; cloned %d dirs, %d files\n",

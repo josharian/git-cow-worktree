@@ -226,13 +226,29 @@ func pathHasPrefix(child, parent string) bool {
 	return strings.HasPrefix(cr, pr)
 }
 
+// absClean returns p as an absolute path with symlinks resolved.
+//
+// A path that doesn't exist yet still resolves: we walk up to its deepest
+// existing ancestor and re-attach the rest. The worktree we are about to
+// create is named before it exists, and on macOS the difference matters —
+// /tmp and /var are symlinks, so an unresolved name would compare unequal to
+// the resolved one Git records, and the new worktree could be mistaken for a
+// candidate source for itself.
 func absClean(p string) (string, error) {
 	r, err := osAbs(p)
 	if err != nil {
 		return "", err
 	}
-	if real, err := filepath.EvalSymlinks(r); err == nil {
-		return filepath.Clean(real), nil
+	rest := ""
+	for dir := r; ; {
+		if real, err := filepath.EvalSymlinks(dir); err == nil {
+			return filepath.Join(real, rest), nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return r, nil // nothing along the way exists
+		}
+		rest = filepath.Join(filepath.Base(dir), rest)
+		dir = parent
 	}
-	return r, nil
 }
