@@ -138,24 +138,32 @@ func worktreeMtime(path string) int64 {
 	return st.ModTime().Unix()
 }
 
-// pickSource scores each candidate by commits ahead+behind vs targetSHA
-// (in repoDir) and returns the best candidate, its score, and ok=true.
-// Returns ok=false if there are no candidates or all scoring calls failed.
+// scoredSource is a candidate source worktree and its distance, in commits,
+// from the target.
+type scoredSource struct {
+	WT    Worktree
+	Score int
+}
+
+// rankSources scores each candidate by commits ahead+behind vs targetSHA (in
+// repoDir) and returns them best-first, dropping any whose scoring failed.
 // Ties break by candidate order (cwd first, then main, then mtime).
 // Candidates are scored in parallel since each is a separate `git rev-list`.
-func pickSource(repoDir string, candidates []Worktree, targetSHA string) (best Worktree, score int, ok bool) {
+//
+// The whole ranking is returned, not just the winner, because distance alone
+// doesn't establish that a worktree is worth cloning from: see analyze.
+func rankSources(repoDir string, candidates []Worktree, targetSHA string) []scoredSource {
 	type scored struct {
-		wt    Worktree
-		score int
-		err   error
-		rank  int // preference order: cwd=0, main=1, others=2+
+		scoredSource
+		err  error
+		rank int // preference order: cwd=0, main=1, others=2+
 	}
 	results := make([]scored, len(candidates))
 	var wg sync.WaitGroup
 	for i, c := range candidates {
 		wg.Go(func() {
 			s, err := commitDistance(repoDir, c.HEAD, targetSHA)
-			results[i] = scored{wt: c, score: s, err: err, rank: i}
+			results[i] = scored{scoredSource: scoredSource{WT: c, Score: s}, err: err, rank: i}
 		})
 	}
 	wg.Wait()
@@ -167,16 +175,17 @@ func pickSource(repoDir string, candidates []Worktree, targetSHA string) (best W
 		}
 		ss = append(ss, r)
 	}
-	if len(ss) == 0 {
-		return Worktree{}, 0, false
-	}
 	sort.SliceStable(ss, func(i, j int) bool {
-		if ss[i].score != ss[j].score {
-			return ss[i].score < ss[j].score
+		if ss[i].Score != ss[j].Score {
+			return ss[i].Score < ss[j].Score
 		}
 		return ss[i].rank < ss[j].rank
 	})
-	return ss[0].wt, ss[0].score, true
+	ranked := make([]scoredSource, len(ss))
+	for i, s := range ss {
+		ranked[i] = s.scoredSource
+	}
+	return ranked
 }
 
 // commitDistance returns commits-ahead + commits-behind between a and b.

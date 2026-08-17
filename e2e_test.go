@@ -480,6 +480,98 @@ func TestE2E_AutoPickSource(t *testing.T) {
 	diffWorktrees(t, plainOut, cowOut)
 }
 
+// TestE2E_SkipsUnmaterializedSource covers the source that scores best and
+// is worth nothing: a worktree sitting exactly on the target commit whose
+// files aren't there yet. `git worktree add --no-checkout` produces one, and
+// so does this command, in the window before it seeds — so a second copy
+// running in another terminal is a real way to hit this.
+//
+// Cloning from it yields an empty plan and a full checkout. Seeding should
+// step over it to the next-best source instead.
+func TestE2E_SkipsUnmaterializedSource(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	gitCowWorktree := buildGitCowWorktree(t)
+
+	// Worktree paths are reported resolved; t.TempDir() hands back a path
+	// under the /var symlink.
+	resolved := func(path string) string {
+		real, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return real
+	}
+
+	mkRepo := func(label string) (*repo, string) {
+		r := newRepo(t, label)
+		r.commit("a.txt", "alpha")
+		r.commit("dir/b.txt", "beta")
+		r.commit("dir/c.txt", "gamma")
+		r.branch("target", "HEAD")
+		r.worktree("good", "target")
+		// Move the main worktree off the target so it scores worse than
+		// the two below and can't win the ranking.
+		r.commit("d.txt", "delta")
+
+		// A worktree on the target commit holding none of it.
+		empty := filepath.Join(r.parent, "empty")
+		cmd := exec.Command("git", "worktree", "add", "-q", "--no-checkout", "--detach", empty, "target")
+		cmd.Dir = r.dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git worktree add --no-checkout: %v\n%s", err, string(out))
+		}
+
+		// Candidates at equal distance are ordered most-recently-modified
+		// first, and mtime here has one-second resolution. Set it, rather
+		// than race two worktrees created in the same second.
+		now := time.Now()
+		if err := os.Chtimes(empty, now, now); err != nil {
+			t.Fatal(err)
+		}
+		old := now.Add(-time.Hour)
+		if err := os.Chtimes(filepath.Join(r.parent, "good"), old, old); err != nil {
+			t.Fatal(err)
+		}
+		return r, resolved(empty)
+	}
+
+	cowRepo, empty := mkRepo("degenerate-cow")
+	plainRepo, _ := mkRepo("degenerate-plain")
+
+	cowOut := filepath.Join(cowRepo.parent, "out-cow")
+	cmd := exec.Command(gitCowWorktree, "add", "-v", "--detach", cowOut, "target")
+	cmd.Dir = cowRepo.dir
+	var sb bytes.Buffer
+	cmd.Stderr = &sb
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git-cow-worktree add: %v\n%s", err, sb.String())
+	}
+	out := sb.String()
+	t.Logf("git-cow-worktree output:\n%s", out)
+
+	if !strings.Contains(out, "skipping source "+empty) {
+		t.Errorf("expected the unmaterialized worktree to be skipped, got:\n%s", out)
+	}
+	if want := "source=" + resolved(filepath.Join(cowRepo.parent, "good")); !strings.Contains(out, want) {
+		t.Errorf("expected %q, got:\n%s", want, out)
+	}
+	// The point of stepping over it: seeding actually happens.
+	if !strings.Contains(out, "cloned ") || strings.Contains(out, "cloned 0 dirs, 0 files") {
+		t.Errorf("expected files to be cloned from the fallback source, got:\n%s", out)
+	}
+
+	plainOut := filepath.Join(plainRepo.parent, "out-plain")
+	cmd2 := exec.Command("git", "worktree", "add", "--detach", plainOut, "target")
+	cmd2.Dir = plainRepo.dir
+	if got, err := cmd2.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add: %v\n%s", err, string(got))
+	}
+	diffWorktrees(t, plainOut, cowOut)
+	assertIndexUpToDate(t, cowOut, "")
+}
+
 // TestE2E_GuessRemoteRetargets covers a target commit that isn't the one we
 // predicted. Seeding is analyzed against a guess at the target — resolved
 // from the command line, so that the analysis can run while `git worktree

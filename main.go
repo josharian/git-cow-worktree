@@ -15,6 +15,11 @@ import (
 const (
 	commandName        = "git-cow-worktree"
 	maxOtherCandidates = 8
+	// How far down the ranking to look for a source worth cloning from.
+	// Each rejection costs a pair of Git invocations against a worktree
+	// that turned out to be useless, and a source this far from the top is
+	// unlikely to be worth much anyway.
+	maxSourceAttempts = 3
 )
 
 // Options collected from argv after light parsing.
@@ -192,33 +197,88 @@ type analysis struct {
 	Err        error
 }
 
-// analyze picks a source worktree to clone targetSHA from and reads what
-// planning needs from both sides. If explicit is non-nil it is used as the
-// source instead of the best available one.
+// analyze settles on a source worktree to clone targetSHA from and reads
+// what planning needs from both sides. If explicit is non-nil it is used as
+// the source, whatever shape it turns out to be in.
 //
-// The three reads are independent Git invocations, so they run together;
-// ls-tree of the target reads the object store, which the repository the
-// command was run from can serve just as well as the new worktree.
+// Being nearest in commits doesn't make a worktree worth cloning from. One
+// that Git is midway through checking out — including one this command is
+// creating in another terminal — is at the target commit and yet holds
+// almost nothing, so it would contribute nothing but the cost of finding
+// that out. Reject those and move down the ranking.
+//
+// The target tree is the same whichever source wins, so it is read once,
+// alongside the first candidate.
 func analyze(repoDir, targetAbs, targetSHA string, explicit *Worktree, verbose bool) *analysis {
 	a := &analysis{SHA: targetSHA}
+
+	var ranked []scoredSource
 	if explicit != nil {
-		a.Src, a.SrcOK = *explicit, true
-		a.Score, _ = commitDistance(repoDir, a.Src.HEAD, targetSHA)
+		score, _ := commitDistance(repoDir, explicit.HEAD, targetSHA)
+		ranked = []scoredSource{{WT: *explicit, Score: score}}
 	} else {
-		a.Src, a.SrcOK, a.Score = pickAutoSource(repoDir, targetAbs, targetSHA, verbose)
+		ranked = rankAutoSources(repoDir, targetAbs, targetSHA, verbose)
 	}
-	if !a.SrcOK {
+	if len(ranked) == 0 {
 		return a
 	}
 
-	var targetErr, srcErr, exclErr error
+	var targetErr error
 	var wg sync.WaitGroup
 	wg.Go(func() { a.TargetTree, targetErr = lsTree(repoDir, targetSHA) })
-	wg.Go(func() { a.SrcTree, srcErr = lsTree(a.Src.Path, a.Src.HEAD) })
-	wg.Go(func() { a.Excluded, exclErr = sourceExclusions(a.Src.Path, a.Src.HEAD) })
+
+	for i, c := range ranked {
+		if i == maxSourceAttempts {
+			break
+		}
+		r, err := readSource(c.WT)
+		switch {
+		case err != nil:
+			if verbose {
+				fmt.Fprintf(os.Stderr, "%s: skipping source %s: %v\n", commandName, c.WT.Path, err)
+			}
+			continue
+		case explicit == nil && !r.usable():
+			if verbose {
+				fmt.Fprintf(os.Stderr, "%s: skipping source %s: %d of %d tracked files differ from its HEAD\n",
+					commandName, c.WT.Path, r.Dirty, len(r.Tree.Blobs))
+			}
+			continue
+		}
+		a.Src, a.Score, a.SrcOK = c.WT, c.Score, true
+		a.SrcTree, a.Excluded = r.Tree, r.Excluded
+		break
+	}
+
 	wg.Wait()
-	a.Err = cmp.Or(targetErr, srcErr, exclErr)
+	a.Err = targetErr
 	return a
+}
+
+// sourceReport is a candidate source worktree seen up close.
+type sourceReport struct {
+	Tree     *treeIndex
+	Excluded map[string]bool
+	Dirty    int // tracked paths whose working-tree copy differs from HEAD
+}
+
+func readSource(wt Worktree) (*sourceReport, error) {
+	var r sourceReport
+	var treeErr, exclErr error
+	var wg sync.WaitGroup
+	wg.Go(func() { r.Tree, treeErr = lsTree(wt.Path, wt.HEAD) })
+	wg.Go(func() { r.Excluded, r.Dirty, exclErr = sourceExclusions(wt.Path, wt.HEAD) })
+	wg.Wait()
+	return &r, cmp.Or(treeErr, exclErr)
+}
+
+// usable reports whether the worktree holds enough of its own commit to be
+// worth cloning from. A worktree Git hasn't finished checking out reads as
+// almost entirely dirty, because every file not yet written differs from
+// HEAD; so does one a user has left in a comparable state, and neither is a
+// good source. Ordinary local work doesn't come close to the threshold.
+func (r *sourceReport) usable() bool {
+	return r.Dirty*2 <= len(r.Tree.Blobs)
 }
 
 // seed reflinks as much of the new worktree as it can from src, and writes
@@ -307,23 +367,19 @@ func resolveFromPath(fromPath string) (Worktree, error) {
 	return Worktree{Path: abs, HEAD: sha}, nil
 }
 
-func pickAutoSource(repoDir, targetAbs, targetSHA string, verbose bool) (Worktree, bool, int) {
+func rankAutoSources(repoDir, targetAbs, targetSHA string, verbose bool) []scoredSource {
 	all, err := listWorktrees(repoDir)
 	if err != nil {
 		if verbose {
 			fmt.Fprintf(os.Stderr, "%s: list worktrees: %v\n", commandName, err)
 		}
-		return Worktree{}, false, 0
+		return nil
 	}
 	pool := candidatePool(all, repoDir, targetAbs, maxOtherCandidates)
 	if len(pool) == 0 {
-		return Worktree{}, false, 0
+		return nil
 	}
-	src, score, ok := pickSource(repoDir, pool, targetSHA)
-	if !ok {
-		return Worktree{}, false, 0
-	}
-	return src, true, score
+	return rankSources(repoDir, pool, targetSHA)
 }
 
 func parseArgs(args []string) (Options, error) {

@@ -148,38 +148,44 @@ func sparseCheckoutEnabled(repoDir string) (bool, error) {
 //
 // Wholly-untracked directories come back as a single entry rather than one
 // per file, which is what keeps this cheap in a repo with a big build cache.
-func sourceExclusions(worktree, ref string) (map[string]bool, error) {
-	excluded := make(map[string]bool)
-	collect := func(args ...string) error {
+// The dirty count it reports back is the tracked half alone, which is what
+// tells a normal worktree apart from one that has no business being cloned
+// from at all.
+func sourceExclusions(worktree, ref string) (excluded map[string]bool, dirty int, err error) {
+	excluded = make(map[string]bool)
+	collect := func(args ...string) (int, error) {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = worktree
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
 		if err != nil {
-			return fmt.Errorf("git %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+			return 0, fmt.Errorf("git %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 		}
+		n := 0
 		for rec := range bytes.SplitSeq(out, []byte{0}) {
 			if len(rec) == 0 {
 				continue
 			}
 			excluded[strings.TrimSuffix(string(rec), "/")] = true
+			n++
 		}
-		return nil
+		return n, nil
 	}
 	// Tracked files whose working-tree copy differs from ref, staged or
 	// not. This trusts the source worktree's stat cache, but only as a
 	// filter: everything we clone is content-verified afterwards.
-	if err := collect("diff-index", "-z", "--name-only", ref); err != nil {
-		return nil, err
+	dirty, err = collect("diff-index", "-z", "--name-only", ref)
+	if err != nil {
+		return nil, 0, err
 	}
 	// Untracked paths. Without --exclude-standard this covers ignored
 	// files too, which is what we want: build output belongs to the
 	// worktree that produced it.
-	if err := collect("ls-files", "-z", "--others", "--directory", "--no-empty-directory"); err != nil {
-		return nil, err
+	if _, err := collect("ls-files", "-z", "--others", "--directory", "--no-empty-directory"); err != nil {
+		return nil, 0, err
 	}
-	return excluded, nil
+	return excluded, dirty, nil
 }
 
 // taint returns the set of directories that contain an excluded path, so
